@@ -1,3 +1,6 @@
+# Note: Automatic credential update via workflow is not working anymore
+Check back with upstream repo for fix. In the meantime, open the [global heatmap](https://www.strava.com/maps/global-heatmap?sport=All&style=standard&terrain=false&labels=true&poi=true&cPhotos=true&gColor=mobileblue&gOpacity=100#11/37.7792/-122.4194), log in, then open developer tools and refresh the page. In the network tab, there should be a request to `https://heatmap-external-a.strava.com/auth` (or `-b` or `-c`). Copy the entire value of the `Cookie` header, and set the cloudflare worker's `STRAVA_COOKIES` secret to this value. This will have to be done every two weeks.
+
 # strava-heatmap-proxy
 
 This is a simple [Cloudflare Worker](https://workers.dev) allowing
