@@ -2,3 +2,5 @@ dist/
 node_modules/
 worker/
 .vscode/
+strava-cookies.json
+.env

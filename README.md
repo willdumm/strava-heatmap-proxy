@@ -1,91 +1,136 @@
-# Note: Automatic credential update via workflow is not working anymore
-Check back with upstream repo for fix. In the meantime, open the [global heatmap](https://www.strava.com/maps/global-heatmap?sport=All&style=standard&terrain=false&labels=true&poi=true&cPhotos=true&gColor=mobileblue&gOpacity=100#11/37.7792/-122.4194), log in, then open developer tools and refresh the page. In the network tab, there should be a request to `https://heatmap-external-a.strava.com/auth` (or `-b` or `-c`). Copy the entire value of the `Cookie` header, and set the cloudflare worker's `STRAVA_COOKIES` secret to this value. This will have to be done every two weeks.
-
 # strava-heatmap-proxy
 
-This is a simple [Cloudflare Worker](https://workers.dev) allowing
-unauthenticated access to personal and global Strava heatmaps. If you want to
-use your personal Strava heatmap in Gaia or Locus, this will give you a URL
-that you can use for that.
+A Cloudflare Worker that proxies authenticated Strava heatmap tiles, letting you use them as a tile layer in mapping apps like Gaia GPS, Locus Map, QGIS, OsmAnd, etc.
 
-Note: you **will** need to be a Strava premium subscriber to use the personal
-heatmap, while the global heatmaps are available to all Strava accounts. Personal
-use only, please. Strava will ratelimit you.
+Pushes to `main` are automatically deployed via GitHub Actions.
 
-# Setup
+---
 
-Follow either of the two paths described below to deploy your Cloudflare
-Worker.
+## How it works
 
-If you want to use these heatmaps as a tile layer in another app, here are the
-template URLs to use:
+Strava requires authentication cookies to serve heatmap tiles. This worker:
 
-- Personal: `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/personal/orange/all/{zoom}/{x}/{y}@2x.png`
-- Global: `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/global/orange/all/{zoom}/{x}/{y}@2x.png`
+1. Holds your Strava session cookie (`_strava4_session`) as a secret
+2. Uses it to automatically fetch short-lived CloudFront auth cookies from Strava on demand
+3. Caches those CloudFront cookies in a KV namespace (~24h TTL, auto-refreshed)
+4. Forwards tile requests to Strava with the appropriate cookies attached
 
-Check `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/` for full list
-of supported tile colors, activities, and sizes.
+You only need to manually update credentials when your Strava session expires (every few months).
 
-## The easy way
+---
 
-Start by forking this repository and setting up some GitHub secrets
-(`github.com/you/strava-heatmap-proxy/settings/secrets/actions`).
+## Tile URLs
 
-- `STRAVA_EMAIL`
-- `STRAVA_PASSWORD`
-- [`CF_ACCOUNT_ID`](https://developers.cloudflare.com/fundamentals/get-started/basic-tasks/find-account-and-zone-ids/)
-- [`CF_API_TOKEN`](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
+Once deployed, use these as tile layer URLs in your mapping app (replace `YOUR_NAMESPACE`):
 
-These secrets will be used by two GitHub Actions:
+| Size | URL |
+|------|-----|
+| 256px | `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/global/:color/:activity/{z}/{x}/{y}@small.png` |
+| 512px | `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/global/:color/:activity/{z}/{x}/{y}.png` |
+| 1024px | `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/global/:color/:activity/{z}/{x}/{y}@2x.png` |
 
-1. [deploy.yml](.github/workflows/deploy.yml): Deploy to Cloudflare on every
-   commit to `main`.
-2. [credentials.yml](.github/workflows/credentials.yml): Fetch fresh Strava
-   cookies once per week.
+Personal heatmap (requires Strava subscription):
 
-Trigger both of these actions for your first deploy, and you should be good to
-go. Your site should now be live on
-`strava-heatmap-proxy.YOUR-NAMESPACE.workers.dev`.
+| Size | URL |
+|------|-----|
+| 512px | `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/personal/:color/:activity/{z}/{x}/{y}.png` |
+| 1024px | `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/personal/:color/:activity/{z}/{x}/{y}@2x.png` |
 
-## Manual
+**Colors:** `mobileblue` `orange` `hot` `blue` `bluered` `purple` `gray`
+**Activities:** `all` `ride` `winter` `run` `water`
 
-Requirements:
+Visit the worker root URL (`/`) for the full listing.
 
-  - [wrangler](https://github.com/cloudflare/wrangler) to manage Worker deployments
-  - [deno](https://deno.land) to run Strava authentication script
+---
 
-Strava's API doesn't support this kind of access directly, so we'll need to
-log in with an email and password and grab session cookies for
-authentication.
+## First-time setup
 
-This can either be done manually in the browser or via
-`./scripts/refresh_strava_credentials.ts`
+### 1. Fork and clone this repo
 
-``` console
-$ export STRAVA_EMAIL="my-strava-account@example.com"
-$ export STRAVA_PASSWORD="hunter2"
-$
-$ ./scripts/refresh_strava_credentials.ts
-STRAVA_ID=12345
-STRAVA_COOKIES=...
+### 2. Export your Strava cookies
+
+Install the **strava-cookie-exporter** browser extension:
+- [Firefox](https://addons.mozilla.org/firefox/addon/strava-cookie-exporter/)
+- [Chrome](https://chromewebstore.google.com/detail/strava-cookie-exporter/apkhbbckeaminpphaaaabpkhgimojlhk)
+
+Log into [Strava](https://www.strava.com/maps/global-heatmap), then use the extension to export your cookies as a JSON file.
+
+### 3. Create a KV namespace
+
+```console
+npx wrangler kv namespace create STRAVA_CACHE
 ```
 
-Now that we have these values, let's store them as Worker secrets.
+Copy the `id` from the output into `wrangler.toml`:
 
-``` console
-$ wrangler login
-$ echo "1234" | wrangler secret put STRAVA_ID
-$ echo "...." | wrangler secret put STRAVA_COOKIES
+```toml
+[[kv_namespaces]]
+binding = "STRAVA_CACHE"
+id = "paste-your-id-here"
 ```
 
-Check that everything's working by running `wrangler dev`.
+### 4. Set Worker secrets
 
-Here's an example tile URL with some data:
-[/global/mobileblue/all/11/351/817@2x.png](http://127.0.0.1:8787/global/mobileblue/all/11/351/817@2x.png)
-(Downtown Los Angeles)
+Extract values from your exported cookies file and upload them as Worker secrets:
 
-When you're all set, use `wrangler publish` to bring the site live on
-`strava-heatmap-proxy.YOUR-NAMESPACE.workers.dev`
+```console
+# Get STRAVA_SESSION value
+node -e "const c=JSON.parse(require('fs').readFileSync('strava-cookies.json','utf8')); console.log(c.find(x=>x.name==='_strava4_session').value)"
 
-Heads up, your credentials will expire after a few weeks, considering creating
-a periodic task to refresh them every 7 days or so.
+# Get STRAVA_ID value (personal heatmap only)
+node -e "const c=JSON.parse(require('fs').readFileSync('strava-cookies.json','utf8')); console.log(c.find(x=>x.name==='strava_remember_id').value)"
+
+# Upload secrets to Cloudflare
+echo "<session-value>" | npx wrangler secret put STRAVA_SESSION
+echo "<strava-id>"     | npx wrangler secret put STRAVA_ID
+```
+
+`STRAVA_ID` is only needed if you use the `/personal/` tile URLs.
+
+### 5. Deploy manually (optional)
+
+```console
+npx wrangler deploy
+```
+
+### 6. Set up GitHub Actions (for auto-deploy on push)
+
+Add these secrets to your GitHub repo (`Settings → Secrets → Actions`):
+
+| Secret | Where to find it |
+|--------|-----------------|
+| `CF_ACCOUNT_ID` | [Cloudflare dashboard](https://dash.cloudflare.com) → right sidebar |
+| `CF_API_TOKEN` | [Create a token](https://dash.cloudflare.com/profile/api-tokens) with the **Edit Cloudflare Workers** template |
+
+After this, every push to `main` will automatically deploy the worker.
+
+> **Note:** `STRAVA_SESSION` and `STRAVA_ID` are Cloudflare Worker secrets (set via wrangler), not GitHub secrets. GitHub Actions only needs `CF_ACCOUNT_ID` and `CF_API_TOKEN` to deploy code.
+
+---
+
+## Refreshing credentials
+
+**CloudFront cookies** (~24h expiry) are refreshed automatically by the worker — no action needed.
+
+**Strava session** (`STRAVA_SESSION`) lasts several months. When it expires the worker will return errors. To fix — you only need to update this one secret, nothing else (no KV changes, no redeployment):
+
+1. Re-export cookies from your browser using the extension
+2. Find the `_strava4_session` entry in the JSON file and copy its `value`:
+   ```json
+   { "name": "_strava4_session", "value": "abc123..." }
+   ```
+3. Update the secret:
+   ```console
+   echo "abc123..." | npx wrangler secret put STRAVA_SESSION
+   ```
+
+---
+
+## Configuration
+
+Edit `wrangler.toml` to change:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TILE_CACHE_SECS` | `86400` | Seconds Cloudflare caches each tile. Set to `0` to disable. |
+| `ALLOWED_ORIGINS` | `` (all) | Comma-separated CORS origins to allow, e.g. `https://example.com`. Empty = allow all. |

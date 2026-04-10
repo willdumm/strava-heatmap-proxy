@@ -1,44 +1,105 @@
-const Router = require("./router");
+/**
+ * Strava Heatmap Proxy - Cloudflare Worker
+ *
+ * Required secrets (set via `wrangler secret put`):
+ *   STRAVA_SESSION  - value of _strava4_session cookie (from browser)
+ *   STRAVA_ID       - your Strava user ID (for personal heatmaps only)
+ *
+ * Required KV namespace binding (see wrangler.toml):
+ *   STRAVA_CACHE    - used to cache refreshed CloudFront cookies
+ *
+ * Optional vars (wrangler.toml):
+ *   TILE_CACHE_SECS  - seconds to cache tiles (default 0 = disabled)
+ *   ALLOWED_ORIGINS  - comma-separated CORS origins (default * = all)
+ */
 
-// The Cloudflare worker runtime populates these globals.
-//
-// `globalThis` solves the chicken-and-egg problem of not being able to deploy
-// the worker without the secret defined, and not being able to define the secret
-// without the working already being deployed. See here for more context:
-// https://github.com/cloudflare/wrangler/issues/1418
-const Env = {
-  STRAVA_ID: globalThis.STRAVA_ID,
-  STRAVA_COOKIES: globalThis.STRAVA_COOKIES,
-  TILE_CACHE_SECS: +TILE_CACHE_SECS || 0,
-  ALLOWED_ORIGINS: (globalThis.ALLOWED_ORIGINS || '*').split(','),
-};
+const CLOUDFRONT_CACHE_KEY = 'cloudfront_cookies';
 
-addEventListener("fetch", (event) => {
-  event.respondWith(handleRequest(event));
-});
+// Strava changed the global heatmap endpoint. Old: heatmap-external-c.strava.com/tiles-auth/
+const GLOBAL_MAP_URL =
+  'https://content-a.strava.com/identified/globalheat/{activity}/{color}/{z}/{x}/{y}{res}.png?v=19{qs}';
 
-async function handleRequest(event) {
-  try {
-    let response = await caches.default.match(event.request.url);
+const PERSONAL_MAP_URL =
+  'https://personal-heatmaps-external.strava.com/' +
+  'tiles/{strava_id}/{color}/{z}/{x}/{y}{res}.png' +
+  '?filter_type={activity}&include_everyone=true&include_followers_only=true&respect_privacy_zones=true';
 
-    if (!response) {
-      const r = new Router();
-      r.get("/(personal|global)/.*", (req) => handleTileProxyRequest(req));
-      r.get("/", () => handleIndexRequest());
+async function getCloudFrontCookies(env) {
+  const cached = await env.STRAVA_CACHE.get(CLOUDFRONT_CACHE_KEY, { type: 'json' });
+  if (cached && cached.expires > Date.now()) {
+    return cached.cookieString;
+  }
+  return refreshCloudFrontCookies(env);
+}
 
-      response = await r.route(event.request);
+async function refreshCloudFrontCookies(env) {
+  if (!env.STRAVA_SESSION) {
+    throw new Error('STRAVA_SESSION secret is not set. See README for setup instructions.');
+  }
 
-      if (Env.TILE_CACHE_SECS > 0 && response.status === 200) {
-        response = new Response(response.body, response);
-        response.headers.append("Cache-Control", `maxage=${Env.TILE_CACHE_SECS}`);
-        event.waitUntil(caches.default.put(event.request.url, response.clone()));
+  // A HEAD request to /maps with the session cookie causes Strava to issue fresh CloudFront cookies.
+  const resp = await fetch('https://www.strava.com/maps', {
+    method: 'HEAD',
+    headers: {
+      Cookie: `_strava4_session=${env.STRAVA_SESSION}`,
+    },
+    redirect: 'follow',
+  });
+
+  if (resp.status !== 200) {
+    throw new Error(
+      `Failed to refresh CloudFront cookies: HTTP ${resp.status}. ` +
+      'STRAVA_SESSION may have expired — re-export cookies from your browser and update the secret.'
+    );
+  }
+
+  const cookieValues = {};
+  let expires = Date.now() + 86400 * 1000; // default 24h if expiry not specified
+
+  // CF Workers supports getAll() to retrieve each Set-Cookie header individually
+  const setCookies = typeof resp.headers.getAll === 'function'
+    ? resp.headers.getAll('set-cookie')
+    : [];
+  for (const cookie of setCookies) {
+    const eqIdx = cookie.indexOf('=');
+    if (eqIdx === -1) continue;
+    const name = cookie.substring(0, eqIdx).trim();
+    const value = cookie.substring(eqIdx + 1).split(';')[0].trim();
+
+    switch (name) {
+      case 'CloudFront-Signature':
+      case 'CloudFront-Policy':
+      case 'CloudFront-Key-Pair-Id':
+      case '_strava_idcf':
+        cookieValues[name] = value;
+        break;
+      case '_strava_CloudFront-Expires': {
+        const ts = parseInt(value, 10);
+        if (!isNaN(ts)) expires = ts;
+        break;
       }
     }
-
-    return response;
-  } catch (err) {
-    return new Response(`err in request handler: ${err}`, { status: 500 });
   }
+
+  for (const name of ['CloudFront-Signature', 'CloudFront-Policy', 'CloudFront-Key-Pair-Id']) {
+    if (!cookieValues[name]) {
+      throw new Error(
+        `Required cookie "${name}" not returned by Strava. ` +
+        'STRAVA_SESSION may have expired — re-export cookies from your browser and update the secret.'
+      );
+    }
+  }
+
+  const cookieString = Object.entries(cookieValues).map(([k, v]) => `${k}=${v}`).join('; ');
+  const ttl = Math.max(Math.ceil((expires - Date.now()) / 1000), 60);
+
+  await env.STRAVA_CACHE.put(
+    CLOUDFRONT_CACHE_KEY,
+    JSON.stringify({ cookieString, expires }),
+    { expirationTtl: ttl }
+  );
+
+  return cookieString;
 }
 
 function handleIndexRequest() {
@@ -61,65 +122,82 @@ Personal Heatmap
 `);
 }
 
-const PERSONAL_MAP_URL =
-  "https://personal-heatmaps-external.strava.com/" +
-  "tiles/{strava_id}/{color}/{z}/{x}/{y}{res}.png" +
-  "?filter_type={activity}&include_everyone=true" +
-  "&include_followers_only=true&respect_privacy_zones=true";
-
-const GLOBAL_MAP_URL =
-  "https://heatmap-external-c.strava.com/" +
-  "tiles-auth/{activity}/{color}/{z}/{x}/{y}{res}.png?v=19{qs}";
-
-// Proxy requests from /kind/color/activity/z/x/y(?@2x).png to baseUrl
-async function handleTileProxyRequest(request) {
+async function handleTileProxyRequest(request, env) {
   const url = new URL(request.url);
 
   const match = url.pathname.match(
-    new RegExp("(personal|global)/(\\w+)/(\\w+)/(\\d+)/(\\d+)/(\\d+)(@small|@2x)?.png")
+    /\/(personal|global)\/(\w+)\/(\w+)\/(\d+)\/(\d+)\/(\d+)(@small|@2x)?\.png/
   );
-  if (match === null) {
-    return new Response("invalid url, expected: /kind/color/activity/z/x/y.png", {
-      status: 400,
-    });
+  if (!match) {
+    return new Response('invalid url, expected: /kind/color/activity/z/x/y.png', { status: 400 });
   }
 
+  const allowedOrigins = (env.ALLOWED_ORIGINS || '*').split(',');
   const origin = request.headers.get('origin');
-  if (!Env.ALLOWED_ORIGINS.includes('*')) {
-    if (origin !== null && !Env.ALLOWED_ORIGINS.includes(origin)) {
-      return new Response('Origin not allowed', { status: 403 });
-    }
+  if (!allowedOrigins.includes('*') && origin !== null && !allowedOrigins.includes(origin)) {
+    return new Response('Origin not allowed', { status: 403 });
   }
 
   const [_, kind, color, activity, z, x, y, res] = match;
+
+  const cloudFrontCookies = await getCloudFrontCookies(env);
+
   const data = {
-    strava_id: Env.STRAVA_ID,
+    strava_id: env.STRAVA_ID || '',
     color,
     activity,
     x,
     y,
     z,
-    // "@small" and "@2x" as part of the URL don't map 1:1 to Strava's API.
-    res: res === "@small" ? '' : (res || ''),
-    qs: res === "@small" ? '&px=256' : '',
+    res: res === '@small' ? '' : (res || ''),
+    qs: res === '@small' ? '&px=256' : '',
   };
 
-  const baseUrl = kind === "personal" ? PERSONAL_MAP_URL : GLOBAL_MAP_URL;
-  // replace templated data in base URL
+  const baseUrl = kind === 'personal' ? PERSONAL_MAP_URL : GLOBAL_MAP_URL;
   const proxyUrl = baseUrl.replace(/\{(\w+)\}/g, (_, key) => data[key]);
 
-  const proxiedRequest = new Request(proxyUrl, {
-    method: "GET",
-    headers: new Headers({ Cookie: Env.STRAVA_COOKIES }),
+  let response = await fetch(proxyUrl, {
+    method: 'GET',
+    headers: { Cookie: cloudFrontCookies },
   });
+  response = new Response(await response.arrayBuffer(), response);
 
-  let response = await fetch(proxiedRequest);
-  response = new Response(
-    await response.arrayBuffer(),
-    response
-  );
-
-  response.headers.append('Access-Control-Allow-Origin', origin);
+  if (origin) {
+    response.headers.append('Access-Control-Allow-Origin', origin);
+  }
 
   return response;
 }
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      const url = new URL(request.url);
+      const tileCacheSecs = +(env.TILE_CACHE_SECS || 0);
+
+      let response = tileCacheSecs > 0
+        ? await caches.default.match(request.url)
+        : null;
+
+      if (!response) {
+        if (url.pathname === '/') {
+          response = handleIndexRequest();
+        } else if (/^\/(personal|global)\//.test(url.pathname)) {
+          response = await handleTileProxyRequest(request, env);
+
+          if (tileCacheSecs > 0 && response.status === 200) {
+            response = new Response(response.body, response);
+            response.headers.append('Cache-Control', `maxage=${tileCacheSecs}`);
+            ctx.waitUntil(caches.default.put(request.url, response.clone()));
+          }
+        } else {
+          response = new Response('not found', { status: 404 });
+        }
+      }
+
+      return response;
+    } catch (err) {
+      return new Response(`error: ${err.message}`, { status: 500 });
+    }
+  },
+};
